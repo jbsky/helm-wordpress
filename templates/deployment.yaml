@@ -1,0 +1,300 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    rollme: {{ randAlphaNum 5 | quote }}
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+  name: {{ include "wordpress.fullname" . }}
+  labels:
+    {{- include "wordpress.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "wordpress.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        rollme: {{ randAlphaNum 5 | quote }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "wordpress.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "wordpress.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        - name: wordpress-files
+          image: {{ .Values.initContainer.image }}
+          imagePullPolicy: {{ .Values.initContainer.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              {{- if .Values.egress.proxyCA }}
+              # Un proxy qui intercepte le TLS presente sa propre CA. Il faut lui
+              # faire confiance AVANT tout appel reseau -- `apk` lui-meme en a
+              # besoin pour son propre miroir, sinon tout echoue en
+              # "self-signed certificate in certificate chain".
+              cat /etc/egress-ca/ca.crt >> /etc/ssl/certs/ca-certificates.crt
+              {{- end }}
+              {{- if .Values.egress.proxy }}
+              export http_proxy={{ .Values.egress.proxy | quote }} https_proxy={{ .Values.egress.proxy | quote }}
+              {{- end }}
+              apk add --no-cache curl >/dev/null
+              # --connect-timeout/--max-time : sans ca, une connexion qui stale
+              # via le proxy (constate en prod : transfert bloque a mi-chemin,
+              # aucune progression, curl ne remonte JAMAIS d'erreur ni de
+              # timeout par defaut) bloque l'initContainer indefiniment. --retry
+              # laisse une chance en cas d'echec transitoire avant que kubelet
+              # ne redemarre le container.
+              curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+                https://wordpress.org/latest.tar.gz -o /tmp/wp.tar.gz
+              tar xzf /tmp/wp.tar.gz -C /mnt/wordpress --strip-components=1
+              rm -f /tmp/wp.tar.gz
+              {{- if .Values.redis.enabled }}
+              # Cache d'objets : le drop-in wp-content/object-cache.php
+              # appartient au plugin redis-cache et ne fonctionne que si le
+              # repertoire du plugin est present. Le plugin n'est installe
+              # que s'il manque -- ses mises a jour passent par wp-admin,
+              # comme n'importe quel plugin, et le reecrire a chaud sous un
+              # pod encore en service serait une mauvaise idee. Le drop-in,
+              # lui, est resynchronise a chaque demarrage : c'est la copie
+              # que WordPress charge, elle ne doit jamais diverger de la
+              # version du plugin reellement installee.
+              if [ ! -d /data/plugins/redis-cache ]; then
+                apk add --no-cache unzip >/dev/null
+                curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+                  https://downloads.wordpress.org/plugin/redis-cache.latest-stable.zip -o /tmp/redis-cache.zip
+                unzip -q /tmp/redis-cache.zip -d /data/plugins
+                rm -f /tmp/redis-cache.zip
+              fi
+              cp -f /data/plugins/redis-cache/includes/object-cache.php /data/object-cache.php
+              {{- else }}
+              # Redis desactive : le drop-in doit partir avec lui, sinon
+              # chaque requete tente une connexion qui n'aboutira pas.
+              rm -f /data/object-cache.php
+              {{- end }}
+              {{- if .Values.wordfence.extendedProtection }}
+              # Protection etendue de Wordfence : le pare-feu doit s'executer
+              # AVANT WordPress, ce que seul auto_prepend_file permet. Les deux
+              # fichiers vivent dans /var/www/html, qui est un emptyDir : ils
+              # sont donc recrees ici a chaque demarrage. Sans cela la
+              # protection ne survit pas au premier redemarrage -- c'est
+              # exactement ce qui s'etait produit, la directive etant montee
+              # dans le conteneur nginx (qui n'execute aucun PHP) et sa cible
+              # n'existant nulle part.
+              #
+              # Ordre imperatif : la cible d'abord, la directive ensuite. Un
+              # auto_prepend_file qui pointe sur un fichier absent n'est pas un
+              # avertissement mais une erreur FATALE -- 500 sur toutes les pages.
+              if [ -f /data/plugins/wordfence/waf/bootstrap.php ]; then
+                cat > /mnt/wordpress/wordfence-waf.php <<'WFPREPEND'
+              <?php
+              // Genere par l'initContainer du pod a chaque demarrage. Ne pas editer ici.
+              //
+              // Le file_exists n'est pas decoratif : il transforme la fenetre pendant
+              // laquelle le repertoire de l'extension disparait -- une mise a jour depuis
+              // wp-admin -- en simple non-execution du pare-feu, la ou une cible manquante
+              // dans auto_prepend_file rendrait un 500 sur tout le site.
+              if (file_exists(__DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php')) {
+                  if (!defined('WFWAF_LOG_PATH')) {
+                      define('WFWAF_LOG_PATH', __DIR__ . '/wp-content/wflogs/');
+                  }
+                  include_once __DIR__ . '/wp-content/plugins/wordfence/waf/bootstrap.php';
+              }
+              WFPREPEND
+                printf '%s\n' '; Wordfence WAF' \
+                  "auto_prepend_file = '/var/www/html/wordfence-waf.php'" \
+                  '; END Wordfence WAF' > /mnt/wordpress/.user.ini
+              else
+                echo "wordfence absent de wp-content : protection etendue non activee"
+                rm -f /mnt/wordpress/.user.ini /mnt/wordpress/wordfence-waf.php
+              fi
+              {{- else }}
+              rm -f /mnt/wordpress/.user.ini /mnt/wordpress/wordfence-waf.php
+              {{- end }}
+              {{- if .Files.Glob "files/mu-plugins/*.php" }}
+              # mu-plugins du site (cf. templates/configmap-mu-plugins.yaml).
+              # Resynchronises a chaque demarrage : la ConfigMap fait foi, une
+              # retouche a chaud sur le volume est ecrasee au prochain rollout.
+              mkdir -p /data/mu-plugins
+              cp -fL /site-mu-plugins/*.php /data/mu-plugins/
+              {{- end }}
+              chown -R 1999:1999 /data /mnt/wordpress
+          volumeMounts:
+            - name: wordpress-data
+              mountPath: /mnt/wordpress
+            - mountPath: /data
+              name: wp-content
+              subPath: wp-content
+            {{- if .Values.egress.proxyCA }}
+            - name: egress-ca
+              mountPath: /etc/egress-ca
+            {{- end }}
+            {{- if .Files.Glob "files/mu-plugins/*.php" }}
+            - name: site-mu-plugins
+              mountPath: /site-mu-plugins
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml .Values.nginx.resources | nindent 12 }}
+          securityContext:
+            runAsUser: 0
+      containers:
+        - name: nginx
+          securityContext:
+            {{- toYaml .Values.nginx.securityContext | nindent 12 }}
+          image: {{ .Values.nginx.image }}
+          imagePullPolicy: {{ .Values.nginx.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.nginx.containerPort }}
+              protocol: TCP
+          volumeMounts:
+          - name: wordpress-data
+            mountPath: /var/www/html
+          - name: wp-content
+            mountPath: /var/www/html/wp-content
+            subPath: wp-content
+          - name: {{ include "wordpress.fullname" . }}
+            mountPath: /var/www/html/wp-config.php
+            subPath: wp-config.php
+          {{- range $path, $_ := $.Files.Glob "nginx/*" }}
+          - name: {{ include "wordpress.fullname" $ }}
+            mountPath: /etc/nginx/conf.d/{{ base $path }}
+            subPath: {{ base $path }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthcheck
+              port: {{ .Values.service.targetPort }}
+              {{- if .Values.domain }}
+              httpHeaders:
+                - name: Host
+                  value: {{ .Values.domain | quote }}
+              {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthcheck
+              port: {{ .Values.service.targetPort }}
+              {{- if .Values.domain }}
+              httpHeaders:
+                - name: Host
+                  value: {{ .Values.domain | quote }}
+              {{- end }}
+          resources:
+            {{- toYaml .Values.nginx.resources | nindent 12 }}
+        - image: {{ .Values.phpfpm.image }}
+          securityContext:
+            {{- toYaml .Values.phpfpm.securityContext | nindent 12 }}
+          imagePullPolicy: {{ .Values.phpfpm.pullPolicy }}
+          name: phpfpm
+          {{- with .Values.phpfpm.env }}
+          env:
+          {{- range $key, $value := . }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+          {{- end }}
+          {{- end }}
+          ports:
+          - containerPort: {{ .Values.phpfpm.containerPort }}
+            name: phpfpm
+          resources:
+            {{- toYaml .Values.phpfpm.resources | nindent 12 }}
+          volumeMounts:
+          # Le core WordPress, telecharge par l'initContainer. php-fpm lit
+          # lui-meme les .php que nginx lui designe : sans ce montage il
+          # repond "Primary script unknown" sur tout le site. Il etait
+          # present sur l'objet Deployment en live mais absent du chart --
+          # ajoute a la main un jour, et jamais efface par les `helm
+          # upgrade` suivants (le patch strategic-merge ne retire pas une
+          # entree que ni l'ancien ni le nouveau manifeste ne mentionnent).
+          # Declare ici pour que le chart decrive ce qui tourne.
+          - name: wordpress-data
+            mountPath: /var/www/html
+          - name: wp-content
+            mountPath: /var/www/html/wp-content
+            subPath: wp-content
+          - name: {{ include "wordpress.fullname" . }}
+            mountPath: /usr/local/etc/php/php.ini
+            subPath: php.ini
+          - name: {{ include "wordpress.fullname" . }}
+            mountPath: /usr/local/etc/php-fpm.d/www.conf
+            subPath: www.conf
+          - name: {{ include "wordpress.fullname" . }}
+            mountPath: /var/www/html/wp-config.php
+            subPath: wp-config.php
+        - name: phpfpm-exporter
+          image: {{ .Values.phpfpmexporter.image }}
+          ports:
+            - name: phpfpm-exporter
+              containerPort: {{ .Values.phpfpmexporter.containerPort }}
+          {{- with .Values.phpfpmexporter.env }}
+          env:
+          {{- range $key, $value := . }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.phpfpmexporter.resources | nindent 12 }}
+        - name: nginx-exporter
+          image: {{ .Values.nginxexporter.image }}
+          args:
+          {{- range .Values.nginxexporter.args }}
+          - {{ . | quote }}
+          {{- end }}
+          ports:
+            - name: nginx-exporter
+              containerPort: {{ .Values.nginxexporter.containerPort }}
+          {{- with .Values.nginxexporter.env }}
+          env:
+          {{- range $key, $value := . }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.nginxexporter.resources | nindent 12 }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+      - name: wp-content
+        persistentVolumeClaim:
+          claimName: {{ include "wordpress.fullname" . }}
+      - name: {{ include "wordpress.fullname" . }}
+        configMap:
+          name: {{ include "wordpress.fullname" . }}
+      - name: wordpress-data
+        emptyDir: {}
+      {{- if .Values.egress.proxyCA }}
+      - name: egress-ca
+        configMap:
+          name: {{ include "wordpress.fullname" . }}-egress-ca
+      {{- end }}
+      {{- if .Files.Glob "files/mu-plugins/*.php" }}
+      - name: site-mu-plugins
+        configMap:
+          name: {{ include "wordpress.fullname" . }}-mu-plugins
+      {{- end }}

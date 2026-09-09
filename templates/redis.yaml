@@ -1,0 +1,115 @@
+{{- if .Values.redis.enabled }}
+# ──────────────────────────────────────────────────────────────────────
+#  Redis — cache d'objets persistant de WordPress (drop-in
+#  wp-content/object-cache.php, plugin redis-cache installe par
+#  l'initContainer).
+#
+#  Deployment separe et NON un sidecar : le pod WordPress porte une
+#  annotation `rollme` regeneree a chaque `helm upgrade`, donc chaque
+#  deploiement le recree. Un Redis embarque dans ce pod repartirait vide
+#  a chaque deploiement, ce qui est exactement ce qu'un cache ne doit pas
+#  faire.
+#
+#  Les labels ne reprennent volontairement PAS `wordpress.selectorLabels`
+#  (name=wordpress + instance=<release>) :
+#    - le Service WordPress selectionne sur ces deux labels seuls ; un pod
+#      Redis qui les porterait entrerait dans ses Endpoints sur le port
+#      8080, qu'il n'ecoute pas ;
+#    - le workflow de deploiement fait `kubectl get deployment -l
+#      app.kubernetes.io/instance=<ns> | head -1` pour son rollout
+#      restart : un Deployment "…-redis" arriverait avant "…-wordpress"
+#      dans l'ordre alphabetique et le restart tomberait sur le mauvais.
+# ──────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "wordpress.fullname" . }}-redis
+  labels:
+    {{- include "wordpress.redisLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "wordpress.redisSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "wordpress.redisLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsUser: {{ .Values.redis.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.redis.securityContext.runAsUser }}
+        runAsNonRoot: true
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: {{ .Values.redis.pullPolicy }}
+          # Un cache, pas une base : aucune persistance (ni RDB ni AOF),
+          # une borne memoire et une politique d'eviction. Sans
+          # `maxmemory-policy`, Redis refuse les ecritures une fois
+          # `maxmemory` atteint (noeviction par defaut) au lieu d'evincer,
+          # et WordPress recolte des erreurs la ou il attend un cache qui
+          # oublie.
+          args:
+            - redis-server
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - {{ .Values.redis.maxmemory | quote }}
+            - --maxmemory-policy
+            - {{ .Values.redis.maxmemoryPolicy | quote }}
+            - --dir
+            - /data
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        # Rien n'y est jamais ecrit (save "" + appendonly no) : le volume
+        # n'existe que parce que `--dir` doit pointer sur un chemin
+        # accessible en ecriture, le rootfs etant en lecture seule.
+        - name: data
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "wordpress.fullname" . }}-redis
+  labels:
+    {{- include "wordpress.redisLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6379
+      targetPort: redis
+      protocol: TCP
+      name: redis
+  selector:
+    {{- include "wordpress.redisSelectorLabels" . | nindent 4 }}
+{{- end }}

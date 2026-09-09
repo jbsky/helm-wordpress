@@ -1,0 +1,23 @@
+{{- if .Files.Glob "files/mu-plugins/*.php" }}
+{{/*
+  mu-plugins propres au site. Ils arrivent par l'overlay (overlay/<site>/files/
+  mu-plugins/), que la CI recopie dans le chart avant le helm upgrade -- le chart
+  seul n'en embarque aucun.
+
+  Pourquoi une ConfigMap plutot qu'un depot direct dans wp-content : le volume est
+  persistant, un fichier pose a la main y survit indefiniment et n'existe alors
+  nulle part dans git. C'est exactement ce qui est arrive a mermaid-fix.php, ecrit
+  sur le PVC en juin 2026 et introuvable dans le depot jusqu'au 31/08/2026.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "wordpress.fullname" . }}-mu-plugins
+  labels:
+    {{- include "wordpress.labels" . | nindent 4 }}
+data:
+{{- range $path, $_ := .Files.Glob "files/mu-plugins/*.php" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,16 @@
+{{- if .Values.egress.proxyCA }}
+# CA du proxy de sortie. Necessaire seulement quand ce proxy intercepte le TLS :
+# il presente alors sa propre autorite, et sans elle tout appel HTTPS de
+# l'initContainer echoue en "self-signed certificate in certificate chain".
+# Le contenu est une valeur, pas un fichier du chart -- une CA est propre a un
+# site, elle n'a rien a faire dans un paquet distribue.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "wordpress.fullname" . }}-egress-ca
+  labels:
+    {{- include "wordpress.labels" . | nindent 4 }}
+data:
+  ca.crt: |
+{{ .Values.egress.proxyCA | indent 4 }}
+{{- end }}

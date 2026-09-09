@@ -1,0 +1,170 @@
+# Default values for wordpress.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+# Noms de Secrets `kubernetes.io/dockerconfigjson` deja presents dans le
+# namespace. Vide par defaut : les images publiques se tirent sans identifiant.
+# Le chart ne cree pas ce Secret et ne veut pas connaitre son contenu -- une
+# credential dans les valeurs finit en clair dans le Secret de release Helm et
+# dans le depot qui porte le fichier.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+domain: ""
+
+# Sortie internet de l'initContainer, qui va chercher le coeur de WordPress
+# et, si Redis est actif, le plugin de cache d'objets.
+#
+# Par defaut : aucun proxy, acces direct. Un cluster dont les pods n'ont pas
+# d'acces sortant renseigne `proxy` ; si ce proxy intercepte le TLS, il
+# presente sa propre autorite et il faut aussi coller son certificat dans
+# `proxyCA` -- sinon le premier appel HTTPS echoue en "self-signed
+# certificate in certificate chain", `apk` compris.
+egress:
+  proxy: ""
+  # Certificat au format PEM, colle tel quel. Exemple :
+  # proxyCA: |
+  #   -----BEGIN CERTIFICATE-----
+  #   ...
+  #   -----END CERTIFICATE-----
+  proxyCA: ""
+
+# Alpine générique (curl+tar déjà présents via busybox pour tar, curl
+# installé au démarrage) -- récupère toujours le dernier WordPress stable
+# à chaque (re)démarrage du pod, cf. templates/deployment.yaml. Pas
+# d'image dédiée à maintenir : reproductibilité volontairement sacrifiée
+# au profit de "toujours la dernière version".
+initContainer:
+  image: "alpine:3.23"
+  pullPolicy: Always
+
+nginx:
+  image: "jbsky/nginx-waf-hardened:1.30.4.9"
+  pullPolicy: Always
+  containerPort: 8080
+  securityContext:
+    runAsUser: 1999
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+nginxexporter:
+  image: nginx/nginx-prometheus-exporter
+  pullPolicy: Always
+  args:
+    - --nginx.scrape-uri=http://127.0.0.1:8080/metrics/nginx
+  containerPort: 9113
+  nodePort: 30153
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 10m
+      memory: 64Mi
+phpfpm:
+  image: "jbsky/php-fpm-hardened:8.5.9.5"
+  pullPolicy: Always
+  containerPort: 9000
+  securityContext:
+    runAsUser: 1999
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+phpfpmexporter:
+  image: hipages/php-fpm_exporter
+  pullPolicy: Always
+  env:
+    PHP_FPM_SCRAPE_URI: "tcp://localhost:9000/status"
+    PHP_FPM_FIX_PROCESS_COUNT: "true"
+  containerPort: 9253
+  nodePort: 30253
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 10m
+      memory: 64Mi
+
+# Protection etendue de Wordfence (auto_prepend_file). Voir l'initContainer de
+# templates/deployment.yaml : il ecrit /var/www/html/wordfence-waf.php PUIS
+# /var/www/html/.user.ini, et seulement si l'extension est presente -- une cible
+# manquante dans auto_prepend_file est une erreur fatale, pas un avertissement.
+# Faux par defaut : un release sans Wordfence n'a rien a prependre.
+wordfence:
+  extendedProtection: false
+
+# Cache d'objets persistant de WordPress (cf. templates/redis.yaml).
+# Desactive par defaut : le drop-in object-cache.php et les constantes
+# WP_REDIS_* vivent dans l'overlay du site, un release qui n'a pas les deux
+# n'a rien a faire d'un Redis.
+redis:
+  enabled: false
+  image: "redis:8.10-alpine"
+  pullPolicy: IfNotPresent
+  # 96 Mo suffisent tres largement au cache d'objets d'un blog ; la borne
+  # existe surtout pour que l'eviction LRU se declenche avant la limite du
+  # conteneur (un OOMKill perdrait tout le cache d'un coup).
+  maxmemory: "96mb"
+  maxmemoryPolicy: "allkeys-lru"
+  securityContext:
+    # uid de l'utilisateur `redis` dans l'image officielle
+    runAsUser: 999
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  fsGroup: 1999
+
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

@@ -1,0 +1,4 @@
+# fichiers de configuration du site, deposes avant installation
+/php/
+/nginx/
+/files/

@@ -1,0 +1,27 @@
+apiVersion: v2
+name: wordpress-hardened
+description: WordPress sur Kubernetes avec des images durcies FROM scratch, sans shell et non-root
+type: application
+
+# Version du chart. Incrementee a chaque changement du chart lui-meme.
+version: 0.1.0
+
+# WordPress n'est pas fige par ce chart : l'initContainer va chercher la
+# derniere version stable a chaque demarrage du pod. Il n'y a donc pas de
+# version applicative a declarer ici, et `appVersion` est volontairement absent.
+
+keywords:
+  - wordpress
+  - php-fpm
+  - hardened
+  - from-scratch
+  - modsecurity
+
+home: https://github.com/jbsky/wordpress-hardened
+sources:
+  - https://github.com/jbsky/php-fpm-hardened
+  - https://github.com/jbsky/nginx-hardened
+
+maintainers:
+  - name: jbsky
+    url: https://jbsky.fr/
