@@ -1,60 +1,58 @@
-# WordPress Hardened -- chart Helm
+# WordPress Hardened (Helm chart)
 
-Chart Helm qui fait tourner WordPress sur Kubernetes avec des images durcies
-**FROM scratch** : aucun shell, aucun gestionnaire de paquets, non-root.
+A Helm chart that runs WordPress on Kubernetes with hardened **FROM scratch**
+images: no shell, no package manager, non-root.
 
-| Conteneur | Image | Role |
+| Container | Image | Role |
 |---|---|---|
-| `nginx` | [`jbsky/nginx-waf-hardened`](https://github.com/jbsky/nginx-hardened) | sert les fichiers statiques, proxifie le PHP, ModSecurity + OWASP CRS |
-| `php-fpm` | [`jbsky/php-fpm-hardened`](https://github.com/jbsky/php-fpm-hardened) | execute WordPress |
-| `nginx-exporter` | `nginx/nginx-prometheus-exporter` | metriques nginx |
-| `phpfpm-exporter` | `hipages/php-fpm_exporter` | metriques du pool FPM |
-| `redis` *(optionnel)* | `redis:alpine` | cache d'objets persistant de WordPress |
+| `nginx` | [`jbsky/nginx-waf-hardened`](https://github.com/jbsky/nginx-hardened) | serves static files, proxies PHP, ModSecurity + OWASP CRS |
+| `php-fpm` | [`jbsky/php-fpm-hardened`](https://github.com/jbsky/php-fpm-hardened) | runs WordPress |
+| `nginx-exporter` | `nginx/nginx-prometheus-exporter` | nginx metrics |
+| `phpfpm-exporter` | `hipages/php-fpm_exporter` | FPM pool metrics |
+| `redis` *(optional)* | `redis:alpine` | WordPress persistent object cache |
 
-Un **initContainer** Alpine prepare le volume : il telecharge la derniere
-version stable de WordPress et la depose dans un `emptyDir` partage. C'est ce
-qui permet a l'image php-fpm de rester sans shell -- elle n'a jamais a copier
-un fichier.
+An Alpine **initContainer** prepares the volume: it downloads the latest
+stable WordPress release and drops it into a shared `emptyDir`. That is what
+lets the php-fpm image stay shell-free -- it never has to copy a file.
 
-## Ce que le chart ne fait pas
+## What the chart does not do
 
-- **Pas de base de donnees.** WordPress attend un MySQL/MariaDB joignable ; les
-  parametres de connexion arrivent avec la configuration du site (voir
-  ci-dessous).
-- **Pas d'ingress.** Le `Service` est en `ClusterIP` ; le routage, la
-  terminaison TLS et le WAF d'entree vivent en amont.
-- **Pas de version de WordPress figee.** L'initContainer prend la derniere
-  stable a chaque demarrage du pod. C'est un choix : pas d'image a reconstruire
-  a chaque sortie, au prix de la reproductibilite.
+- **No database.** WordPress expects a reachable MySQL/MariaDB; the
+  connection settings come with the site configuration (see below).
+- **No ingress.** The `Service` is a `ClusterIP`; routing, TLS termination
+  and the edge WAF live upstream.
+- **No pinned WordPress version.** The initContainer takes the latest stable
+  release on every pod start. That is a choice: no image to rebuild on every
+  release, at the cost of reproducibility.
 
 ## Installation
 
-Le chart ne porte aucune configuration de site. Celle-ci est deposee dans le
-repertoire du chart avant l'installation, sous trois chemins que les templates
-ramassent :
+The chart carries no site configuration. It is dropped into the chart
+directory before installing, under three paths the templates pick up:
 
 ```
-php/*            -> ConfigMap (php.ini, www.conf, wp-config.php...)
-nginx/*          -> ConfigMap (nginx.conf, vhost, regles ModSecurity)
-files/mu-plugins/*.php  -> ConfigMap, montes en mu-plugins
+php/*                   -> ConfigMap (php.ini, www.conf, wp-config.php...)
+nginx/*                 -> ConfigMap (nginx.conf, vhost, ModSecurity rules)
+files/mu-plugins/*.php  -> ConfigMap, mounted as mu-plugins
 ```
 
 ```bash
-cp -a mon-site/php mon-site/nginx mon-site/files .
-helm upgrade mon-site . --install \
-  --namespace mon-site --create-namespace \
-  --values mon-site/values.yaml
+cp -a my-site/php my-site/nginx my-site/files .
+helm upgrade my-site . --install \
+  --namespace my-site --create-namespace \
+  --values my-site/values.yaml
 ```
 
-## Valeurs
+## Values
 
-Les images, les ressources et les contextes de securite se reglent par
-conteneur (`nginx`, `phpfpm`, `nginxexporter`, `phpfpmexporter`). Trois blocs
-meritent une mention :
+Images, resources and security contexts are set per container (`nginx`,
+`phpfpm`, `nginxexporter`, `phpfpmexporter`). Pin the hardened images to
+their current immutable tag, given in the Tags section of each image's README:
+their registries keep only the last six. Three blocks deserve a mention.
 
-### `egress` -- sortie internet de l'initContainer
+### `egress` -- internet access of the initContainer
 
-Par defaut : acces direct, aucun proxy.
+Default: direct access, no proxy.
 
 ```yaml
 egress:
@@ -65,50 +63,49 @@ egress:
     -----END CERTIFICATE-----
 ```
 
-`proxyCA` n'est necessaire que si le proxy **intercepte le TLS** : il presente
-alors sa propre autorite, et sans elle le premier appel HTTPS echoue en
-`self-signed certificate in certificate chain` -- `apk` compris, donc avant
-meme que `curl` ne soit installe.
+`proxyCA` is only needed when the proxy **intercepts TLS**: it then presents
+its own authority, and without it the first HTTPS call fails with
+`self-signed certificate in certificate chain` -- `apk` included, so before
+`curl` is even installed.
 
-### `redis` -- cache d'objets
+### `redis` -- object cache
 
 ```yaml
 redis:
   enabled: true
 ```
 
-Desactive par defaut. Quand il est actif, l'initContainer installe le plugin
-`redis-cache` s'il manque et **resynchronise le drop-in `object-cache.php` a
-chaque demarrage** : c'est la copie que WordPress charge, elle ne doit jamais
-diverger de la version du plugin reellement installee. Les constantes
-`WP_REDIS_*` restent a votre charge, dans la configuration du site.
+Disabled by default. When enabled, the initContainer installs the
+`redis-cache` plugin if it is missing and **resynchronizes the
+`object-cache.php` drop-in on every start**: that is the copy WordPress loads,
+and it must never diverge from the plugin version actually installed. The
+`WP_REDIS_*` constants stay yours to set, in the site configuration.
 
-### `wordfence` -- protection etendue
+### `wordfence` -- extended protection
 
 ```yaml
 wordfence:
   extendedProtection: true
 ```
 
-Ecrit `wordfence-waf.php` puis `.user.ini` dans le volume, dans cet ordre. Un
-`auto_prepend_file` qui pointe sur un fichier absent n'est pas un avertissement
-mais une **erreur fatale** : toutes les pages en 500. A n'activer que si
-l'extension est reellement installee.
+Writes `wordfence-waf.php` then `.user.ini` into the volume, in that order.
+An `auto_prepend_file` pointing to a missing file is not a warning but a
+**fatal error**: every page returns 500. Only enable it when the plugin is
+actually installed.
 
-## Contexte de securite
+## Security context
 
-Les deux conteneurs applicatifs tournent sous le meme UID non-root (1999 par
-defaut) -- c'est ce qui rend le volume partage lisible des deux cotes -- avec
-`allowPrivilegeEscalation: false` et, pour nginx, toutes les capabilities
-retirees.
+Both application containers run under the same non-root UID (1999 by default)
+-- that is what makes the shared volume readable on both sides -- with
+`allowPrivilegeEscalation: false` and, for nginx, every capability dropped.
 
-## Licence
+## License
 
-Ce chart est sous **Apache-2.0**, voir [`LICENSE`](LICENSE).
+This chart is licensed under **Apache-2.0**, see [`LICENSE`](LICENSE).
 Copyright 2026 jbsky.
 
-Les images qu'il deploie ont chacune la leur, dans leur propre depot ; les
-logiciels qu'elles embarquent gardent celle de leur amont.
+The images it deploys each have their own, in their own repository; the
+software they ship keeps its upstream's.
 
-Contributions : voir [`CONTRIBUTING.md`](CONTRIBUTING.md), un `Signed-off-by`
-est demande.
+Contributions: see [`CONTRIBUTING.md`](CONTRIBUTING.md); a `Signed-off-by` is
+required.
