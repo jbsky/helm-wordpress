@@ -17,7 +17,7 @@ keywords:
   - from-scratch
   - modsecurity
 
-home: https://github.com/jbsky/wordpress-hardened
+home: https://github.com/jbsky/helm-wordpress
 sources:
   - https://github.com/jbsky/php-fpm-hardened
   - https://github.com/jbsky/nginx-hardened
